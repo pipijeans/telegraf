@@ -282,7 +282,7 @@ func TestGatherNodeData(t *testing.T) {
 			ResponseTimeout: internal.Duration{Duration: time.Microsecond},
 			NodeExclude:     []string{"ignore-1", "ignore-2"},
 		}
-		te := j.newInstance(ts.Client())
+		te := j.newInstance(&http.Client{Transport: &http.Transport{}})
 		acc := new(testutil.Accumulator)
 		j.gatherNodesData(acc)
 		if err := acc.FirstError(); err != nil {
@@ -328,7 +328,7 @@ func TestNewInstance(t *testing.T) {
 	}
 	ts := httptest.NewServer(mh)
 	defer ts.Close()
-	mockClient := ts.Client()
+	mockClient := &http.Client{Transport: &http.Transport{}}
 	tests := []struct {
 		// name of the test
 		name   string
@@ -667,7 +667,7 @@ func TestGatherJobs(t *testing.T) {
 				"apps/k8s-cloud/PR-ignore2",
 			},
 		}
-		te := j.newInstance(ts.Client())
+		te := j.newInstance(&http.Client{Transport: &http.Transport{}})
 		acc := new(testutil.Accumulator)
 		j.gatherJobs(acc)
 		if err := acc.FirstError(); err != nil {
