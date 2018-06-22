@@ -7,38 +7,38 @@ This plugin does not require a plugin on jenkins and it makes use of Jenkins API
 ### Configuration:
 
 ```toml
-  url = "http://my-jenkins-instance:8080"
-  username = "admin"
-  password = "admin"
-  ## Set response_timeout
-  response_timeout = "5s"
+url = "http://my-jenkins-instance:8080"
+#  username = "admin"
+#  password = "admin"
+## Set response_timeout
+response_timeout = "5s"
 
-  ## Optional SSL Config
-  # ssl_ca = /path/to/cafile
-  # ssl_cert = /path/to/certfile
-  # ssl_key = /path/to/keyfile
-  ## Use SSL but skip chain & host verification
-  # insecure_skip_verify = false
+## Optional SSL Config
+#  ssl_ca = /path/to/cafile
+#  ssl_cert = /path/to/certfile
+#  ssl_key = /path/to/keyfile
+## Use SSL but skip chain & host verification
+#  insecure_skip_verify = false
 
-  ## Job & build filter
-  # max_build_age = "1h"
-  ## jenkins can have unlimited layer of sub jobs
-  ## this config will limit the layers of pull, default value 0 means
-  ## unlimited pulling until no more sub jobs
-  # max_sub_jobs_layer = 0
-  ## in workflow-multibranch-plugin, each branch will be created as a sub job
-  ## this config will limit to call only the lasted branches
-  ## sub jobs fetch in each layer
-  # empty will use default value 10
-  # newest_sub_jobs_each_layer = 10
-  # job_exclude = [ "MyJob", "MyOtherJob" ]
+## Job & build filter
+#  max_build_age = "1h"
+## jenkins can have unlimited layer of sub jobs
+## this config will limit the layers of pull, default value 0 means
+## unlimited pulling until no more sub jobs
+#  max_subjob_depth = 0
+## in workflow-multibranch-plugin, each branch will be created as a sub job
+## this config will limit to call only the lasted branches
+## sub jobs fetch in each layer
+#  empty will use default value 10
+#  max_subjob_per_layer = 10
+#  job_exclude = [ "job1", "job2/subjob1/subjob2", "job3/*"]
 
-  ## Node filter
-  # node_exlude = [ "node1", "node2" ]
+## Node filter
+#  node_exclude = [ "node1", "node2" ]
 
-  ## Woker pool for jenkins plugin only
-  # empty this field will use default value 30
-  # max_tcp_concurrent_connections = 30
+## Woker pool for jenkins plugin only
+#  empty this field will use default value 30
+#  max_connections = 30
 ```
 
 ### Measurements & Fields:

@@ -4,13 +4,13 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"reflect"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/influxdata/telegraf"
+	"github.com/influxdata/telegraf/filter"
 	"github.com/influxdata/telegraf/internal"
 	"github.com/influxdata/telegraf/internal/tls"
 	"github.com/influxdata/telegraf/plugins/inputs"
@@ -28,52 +28,52 @@ type Jenkins struct {
 	tls.ClientConfig
 	instance *gojenkins.Jenkins
 
-	MaxTCPConcurrentConnections int               `toml:"max_tcp_concurrent_connections"`
-	MaxBuildAge                 internal.Duration `toml:"max_build_age"`
-	MaxSubJobsLayer             int               `toml:"max_sub_jobs_layer"`
-	NewestSubJobsEachLayer      int               `toml:"newest_sub_jobs_each_layer"`
-	JobExclude                  []string          `toml:"job_exclude"`
-	jobFilter                   map[string]bool
+	MaxConnections    int               `toml:"max_connections"`
+	MaxBuildAge       internal.Duration `toml:"max_build_age"`
+	MaxSubJobDepth    int               `toml:"max_subjob_depth"`
+	MaxSubJobPerLayer int               `toml:"max_subjob_per_layer"`
+	JobExclude        []string          `toml:"job_exclude"`
+	jobFilter         filter.Filter
 
 	NodeExclude []string `toml:"node_exclude"`
-	nodeFilter  map[string]bool
+	nodeFilter  filter.Filter
 }
 
 type byBuildNumber []gojenkins.JobBuild
 
 const sampleConfig = `
 url = "http://my-jenkins-instance:8080"
-username = "admin"
-password = "admin"
+#  username = "admin"
+#  password = "admin"
 ## Set response_timeout
 response_timeout = "5s"
 
 ## Optional SSL Config
-# ssl_ca = /path/to/cafile
-# ssl_cert = /path/to/certfile
-# ssl_key = /path/to/keyfile
+#  ssl_ca = /path/to/cafile
+#  ssl_cert = /path/to/certfile
+#  ssl_key = /path/to/keyfile
 ## Use SSL but skip chain & host verification
-# insecure_skip_verify = false
+#  insecure_skip_verify = false
 
 ## Job & build filter
-# max_build_age = "1h"
+#  max_build_age = "1h"
 ## jenkins can have unlimited layer of sub jobs
 ## this config will limit the layers of pull, default value 0 means
 ## unlimited pulling until no more sub jobs
-# max_sub_jobs_layer = 0
+#  max_subjob_depth = 0
 ## in workflow-multibranch-plugin, each branch will be created as a sub job
 ## this config will limit to call only the lasted branches
 ## sub jobs fetch in each layer
-# empty will use default value 10
-# newest_sub_jobs_each_layer = 10
-# job_exclude = [ "MyJob", "MyOtherJob" ]
+#  empty will use default value 10
+#  max_subjob_per_layer = 10
+#  job_exclude = [ "job1", "job2/subjob1/subjob2", "job3/*"]
 
 ## Node filter
-# node_exlude = [ "node1", "node2" ]
+#  node_exclude = [ "node1", "node2" ]
 
 ## Woker pool for jenkins plugin only
-# empty this field will use default value 30
-# max_tcp_concurrent_connections = 30
+#  empty this field will use default value 30
+#  max_connections = 30
 `
 
 // measurement
@@ -82,53 +82,46 @@ const (
 	measurementJob  = "jenkins_job"
 )
 
-type typedErr struct {
-	level     int
+// Error base type of error.
+type Error struct {
 	err       error
 	reference string
 	url       string
 }
 
-// const of the error level, default 0 to be the errLevel
-const (
-	errLevel int = iota
-	continueLevel
-	infoLevel
-)
-
-func wrapErr(e typedErr, err error, ref string) *typedErr {
-	return &typedErr{
-		level:     e.level,
+func newError(err error, ref, url string) *Error {
+	return &Error{
 		err:       err,
 		reference: ref,
-		url:       e.url,
+		url:       url,
 	}
 }
 
-func (e *typedErr) Error() string {
+func (e *Error) Error() string {
 	if e == nil {
 		return ""
 	}
-	return fmt.Sprintf("error "+e.reference+"[%s]: %v", e.url, e.err)
+	return fmt.Sprintf("error %s[%s]: %v", e.reference, e.url, e.err)
 }
 
-func badFormatErr(te typedErr, field interface{}, want string, fieldName string) *typedErr {
-	return &typedErr{
-		level:     te.level,
-		err:       fmt.Errorf("fieldName: %s, want %s, got %s", fieldName, want, reflect.TypeOf(field).String()),
+func badFormatErr(url string, field interface{}, want string, fieldName string) *Error {
+	return &Error{
+		err:       fmt.Errorf("fieldName: %s, want %s, got %T", fieldName, want, field),
 		reference: errBadFormat,
-		url:       te.url,
+		url:       url,
 	}
 }
 
 // err references
 const (
 	errParseConfig         = "parse jenkins config"
+	errJobFilterCompile    = "compile job filters"
+	errNodeFilterCompile   = "compile node filters"
 	errConnectJenkins      = "connect jenkins instance"
 	errInitJenkins         = "init jenkins instance"
 	errRetrieveNode        = "retrieving nodes"
 	errRetrieveJobs        = "retrieving jobs"
-	errReadNodeInfo        = "reading node info"
+	errEmptyNodeName       = "empty node name"
 	errEmptyMonitorData    = "empty monitor data"
 	errBadFormat           = "bad format"
 	errRetrieveInnerJobs   = "retrieving inner jobs"
@@ -147,113 +140,111 @@ func (j *Jenkins) Description() string {
 
 // Gather implements telegraf.Input interface
 func (j *Jenkins) Gather(acc telegraf.Accumulator) error {
-	var err error
-	te := typedErr{
-		url: j.URL,
-	}
 	if j.instance == nil {
-		if tErr := j.initJenkins(te); tErr != nil {
-			return tErr
+		client, te := j.initClient()
+		if te != nil {
+			return te
+		}
+		if te = j.newInstance(client); te != nil {
+			return te
 		}
 	}
 
-	nodes, err := j.instance.GetAllNodes()
-	if err != nil {
-		return wrapErr(te, err, errRetrieveNode)
-	}
-
-	jobs, err := j.instance.GetAllJobNames()
-	if err != nil {
-		return wrapErr(te, err, errRetrieveJobs)
-	}
-
-	j.gatherNodesData(nodes, acc)
-	j.gatherJobs(jobs, acc)
+	j.gatherNodesData(acc)
+	j.gatherJobs(acc)
 
 	return nil
 }
 
-func (j *Jenkins) initJenkins(te typedErr) *typedErr {
-	// create instance
+func (j *Jenkins) initClient() (*http.Client, *Error) {
 	tlsCfg, err := j.ClientConfig.TLSConfig()
 	if err != nil {
-		return wrapErr(te, err, errParseConfig)
+		return nil, newError(err, errParseConfig, j.URL)
 	}
-
-	client := &http.Client{
+	return &http.Client{
 		Transport: &http.Transport{
 			TLSClientConfig: tlsCfg,
 		},
 		Timeout: j.ResponseTimeout.Duration,
-	}
+	}, nil
+}
 
+// seperate the client as dependency to use httptest Client for mocking
+func (j *Jenkins) newInstance(client *http.Client) *Error {
+	// create instance
+	var err error
 	j.instance, err = gojenkins.CreateJenkins(client, j.URL, j.Username, j.Password).Init()
 	if err != nil {
-		return wrapErr(te, err, errConnectJenkins)
+		return newError(err, errConnectJenkins, j.URL)
 	}
-	_, err = j.instance.Init()
-	if err != nil {
-		return wrapErr(te, err, errConnectJenkins)
-	}
+
 	// init job filter
-	j.jobFilter = make(map[string]bool)
-	for _, name := range j.JobExclude {
-		j.jobFilter[name] = false
+	j.jobFilter, err = filter.Compile(j.JobExclude)
+	if err != nil {
+		return newError(err, errJobFilterCompile, j.URL)
 	}
 
 	// init node filter
-	j.nodeFilter = make(map[string]bool)
-	for _, name := range j.NodeExclude {
-		j.nodeFilter[name] = false
+	j.nodeFilter, err = filter.Compile(j.NodeExclude)
+	if err != nil {
+		return newError(err, errNodeFilterCompile, j.URL)
 	}
 
 	// init tcp pool with default value
-	if j.MaxTCPConcurrentConnections <= 0 {
-		j.MaxTCPConcurrentConnections = 30
+	if j.MaxConnections <= 0 {
+		j.MaxConnections = 30
 	}
 
 	// default sub jobs can be acquired
-	if j.NewestSubJobsEachLayer <= 0 {
-		j.NewestSubJobsEachLayer = 10
+	if j.MaxSubJobPerLayer <= 0 {
+		j.MaxSubJobPerLayer = 10
 	}
 
 	return nil
 }
 
-func (j *Jenkins) gatherNodeData(node *gojenkins.Node, te typedErr, fields map[string]interface{}, tags map[string]string) *typedErr {
-	tags["node_name"] = node.Raw.DisplayName
-	var ok bool
-	if _, ok = j.nodeFilter[tags["node_name"]]; ok {
-		(&te).level = continueLevel
-		return &te
-	}
+func (j *Jenkins) gatherNodeData(node *gojenkins.Node, url string, acc telegraf.Accumulator) *Error {
+	tags := map[string]string{}
+	fields := make(map[string]interface{})
 
 	info := node.Raw
+
+	// detect the parsing error, since gojenkins lib won't do it
+	if info == nil || info.DisplayName == "" {
+		return newError(nil, errEmptyNodeName, url)
+	}
+
+	tags["node_name"] = info.DisplayName
+	var ok bool
+	// filter out excluded node_name
+	if j.nodeFilter != nil && j.nodeFilter.Match(tags["node_name"]) {
+		return nil
+	}
+
 	if info.MonitorData.Hudson_NodeMonitors_ArchitectureMonitor == nil {
-		return wrapErr(te, fmt.Errorf("check your permission"), errEmptyMonitorData)
+		return newError(fmt.Errorf("maybe check your permission"), errEmptyMonitorData, url)
 	}
 	tags["arch"], ok = info.MonitorData.Hudson_NodeMonitors_ArchitectureMonitor.(string)
 	if !ok {
-		return badFormatErr(te, info.MonitorData.Hudson_NodeMonitors_ArchitectureMonitor, "string", "hudson.node_monitors.ArchitectureMonitor")
+		return badFormatErr(url, info.MonitorData.Hudson_NodeMonitors_ArchitectureMonitor, "string", "hudson.node_monitors.ArchitectureMonitor")
 	}
 
 	tags["status"] = "online"
-	if node.Raw.Offline {
+	if info.Offline {
 		tags["status"] = "offline"
 	}
-
 	fields["response_time"] = info.MonitorData.Hudson_NodeMonitors_ResponseTimeMonitor.Average
 	if diskSpaceMonitor := info.MonitorData.Hudson_NodeMonitors_DiskSpaceMonitor; diskSpaceMonitor != nil {
 		diskSpaceMonitorRoute := "hudson.node_monitors.DiskSpaceMonitor"
 		var diskSpace map[string]interface{}
 		if diskSpace, ok = diskSpaceMonitor.(map[string]interface{}); !ok {
-			return badFormatErr(te, diskSpaceMonitor, "map[string]interface{}", diskSpaceMonitorRoute)
+			return badFormatErr(url, diskSpaceMonitor, "map[string]interface{}", diskSpaceMonitorRoute)
 		}
 		if tags["disk_path"], ok = diskSpace["path"].(string); !ok {
-			return badFormatErr(te, diskSpace["path"], "string", diskSpaceMonitorRoute+".path")
+			return badFormatErr(url, diskSpace["path"], "string", diskSpaceMonitorRoute+".path")
 		}
 		if fields["disk_available"], ok = diskSpace["size"].(float64); !ok {
-			return badFormatErr(te, diskSpace["size"], "float64", diskSpaceMonitorRoute+".size")
+			return badFormatErr(url, diskSpace["size"], "float64", diskSpaceMonitorRoute+".size")
 		}
 	}
 
@@ -261,13 +252,13 @@ func (j *Jenkins) gatherNodeData(node *gojenkins.Node, te typedErr, fields map[s
 		tempSpaceMonitorRoute := "hudson.node_monitors.TemporarySpaceMonitor"
 		var tempSpace map[string]interface{}
 		if tempSpace, ok = tempSpaceMonitor.(map[string]interface{}); !ok {
-			return badFormatErr(te, tempSpaceMonitor, "map[string]interface{}", tempSpaceMonitorRoute)
+			return badFormatErr(url, tempSpaceMonitor, "map[string]interface{}", tempSpaceMonitorRoute)
 		}
 		if tags["temp_path"], ok = tempSpace["path"].(string); !ok {
-			return badFormatErr(te, tempSpace["path"], "string", tempSpaceMonitorRoute+".path")
+			return badFormatErr(url, tempSpace["path"], "string", tempSpaceMonitorRoute+".path")
 		}
 		if fields["temp_available"], ok = tempSpace["size"].(float64); !ok {
-			return badFormatErr(te, tempSpace["size"], "float64", tempSpaceMonitorRoute+".size")
+			return badFormatErr(url, tempSpace["size"], "float64", tempSpaceMonitorRoute+".size")
 		}
 	}
 
@@ -275,182 +266,162 @@ func (j *Jenkins) gatherNodeData(node *gojenkins.Node, te typedErr, fields map[s
 		swapSpaceMonitorRouter := "hudson.node_monitors.SwapSpaceMonitor"
 		var swapSpace map[string]interface{}
 		if swapSpace, ok = swapSpaceMonitor.(map[string]interface{}); !ok {
-			return badFormatErr(te, swapSpaceMonitor, "map[string]interface{}", swapSpaceMonitorRouter)
+			return badFormatErr(url, swapSpaceMonitor, "map[string]interface{}", swapSpaceMonitorRouter)
 		}
 		if fields["swap_available"], ok = swapSpace["availableSwapSpace"].(float64); !ok {
-			return badFormatErr(te, swapSpace["availableSwapSpace"], "float64", swapSpaceMonitorRouter+".availableSwapSpace")
+			return badFormatErr(url, swapSpace["availableSwapSpace"], "float64", swapSpaceMonitorRouter+".availableSwapSpace")
 		}
 		if fields["swap_total"], ok = swapSpace["totalSwapSpace"].(float64); !ok {
-			return badFormatErr(te, swapSpace["totalSwapSpace"], "float64", swapSpaceMonitorRouter+".totalSwapSpace")
+			return badFormatErr(url, swapSpace["totalSwapSpace"], "float64", swapSpaceMonitorRouter+".totalSwapSpace")
 		}
 		if fields["memory_available"], ok = swapSpace["availablePhysicalMemory"].(float64); !ok {
-			return badFormatErr(te, swapSpace["availablePhysicalMemory"], "float64", swapSpaceMonitorRouter+".availablePhysicalMemory")
+			return badFormatErr(url, swapSpace["availablePhysicalMemory"], "float64", swapSpaceMonitorRouter+".availablePhysicalMemory")
 		}
 		if fields["memory_total"], ok = swapSpace["totalPhysicalMemory"].(float64); !ok {
-			return badFormatErr(te, swapSpace["totalPhysicalMemory"], "float64", swapSpaceMonitorRouter+".totalPhysicalMemory")
+			return badFormatErr(url, swapSpace["totalPhysicalMemory"], "float64", swapSpaceMonitorRouter+".totalPhysicalMemory")
 		}
 	}
+	acc.AddFields(measurementNode, fields, tags)
+
 	return nil
 }
 
-func (j *Jenkins) gatherNodesData(nodes []*gojenkins.Node, acc telegraf.Accumulator) {
-
-	tags := map[string]string{}
-	fields := make(map[string]interface{})
-	baseTe := typedErr{
-		url: j.URL + "/computer/api/json",
+func (j *Jenkins) gatherNodesData(acc telegraf.Accumulator) {
+	nodes, err := j.instance.GetAllNodes()
+	url := j.URL + "/computer/api/json"
+	// since gojenkins lib will never return error
+	// returns error for len(nodes) is 0
+	if err != nil || len(nodes) == 0 {
+		acc.AddError(newError(err, errRetrieveNode, url))
+		return
 	}
-
 	// get node data
 	for _, node := range nodes {
-		te := j.gatherNodeData(node, baseTe, fields, tags)
+		te := j.gatherNodeData(node, url, acc)
 		if te == nil {
-			acc.AddFields(measurementNode, fields, tags)
 			continue
 		}
-		switch te.level {
-		case continueLevel:
-			continue
-		default:
-			acc.AddError(te)
-		}
+		acc.AddError(te)
 	}
 }
 
-func (j *Jenkins) gatherJobs(jobNames []gojenkins.InnerJob, acc telegraf.Accumulator) {
-	jobsC := make(chan srcJob, j.MaxTCPConcurrentConnections)
-	errC := make(chan *typedErr)
+func (j *Jenkins) gatherJobs(acc telegraf.Accumulator) {
+	jobs, err := j.instance.GetAllJobNames()
+	if err != nil {
+		acc.AddError(newError(err, errRetrieveJobs, j.URL))
+		return
+	}
+	jobsC := make(chan jobRequest, j.MaxConnections)
 	var wg sync.WaitGroup
-	for _, job := range jobNames {
+	for _, job := range jobs {
 		wg.Add(1)
-		go func(job gojenkins.InnerJob) {
-			jobsC <- srcJob{
-				name:    job.Name,
+		go func(name string) {
+			jobsC <- jobRequest{
+				name:    name,
 				parents: []string{},
 				layer:   0,
 			}
-		}(job)
+		}(job.Name)
 	}
 
-	for i := 0; i < j.MaxTCPConcurrentConnections; i++ {
-		go j.getJobDetail(jobsC, errC, &wg, acc)
-	}
-
-	go func() {
-		wg.Wait()
-		close(errC)
-	}()
-
-	select {
-	case te := <-errC:
-		if te != nil {
-			acc.AddError(te)
-		}
-	}
-}
-
-func (j *Jenkins) getJobDetail(jobsC chan srcJob, errC chan<- *typedErr, wg *sync.WaitGroup, acc telegraf.Accumulator) {
-	for sj := range jobsC {
-		if j.MaxSubJobsLayer > 0 && sj.layer == j.MaxSubJobsLayer {
-			wg.Done()
-			continue
-		}
-		// exclude filter
-		if _, ok := j.jobFilter[sj.name]; ok {
-			wg.Done()
-			continue
-		}
-		te := &typedErr{
-			url: j.URL + "/job/" + strings.Join(sj.combined(), "/job/") + "/api/json",
-		}
-		jobDetail, err := j.instance.GetJob(sj.name, sj.parents...)
-		if err != nil {
-			go func(te typedErr, err error) {
-				errC <- wrapErr(te, err, errRetrieveInnerJobs)
-			}(*te, err)
-			return
-		}
-
-		for k, innerJob := range jobDetail.Raw.Jobs {
-			if k < len(jobDetail.Raw.Jobs)-j.NewestSubJobsEachLayer-1 {
-				continue
-			}
-			wg.Add(1)
-			// schedule tcp fetch for inner jobs
-			go func(innerJob gojenkins.InnerJob, sj srcJob) {
-				jobsC <- srcJob{
-					name:    innerJob.Name,
-					parents: sj.combined(),
-					layer:   sj.layer + 1,
+	for i := 0; i < j.MaxConnections; i++ {
+		go func(jobsC chan jobRequest, acc telegraf.Accumulator, wg *sync.WaitGroup) {
+			for sj := range jobsC {
+				if te := j.getJobDetail(sj, jobsC, wg, acc); te != nil {
+					acc.AddError(te)
 				}
-			}(innerJob, sj)
-		}
-
-		// collect build info
-		number := jobDetail.Raw.LastBuild.Number
-		if number < 1 {
-			// no build info
-			wg.Done()
-			continue
-		}
-		baseURL := "/job/" + strings.Join(sj.combined(), "/job/") + "/" + strconv.Itoa(int(number))
-		// jobDetail.GetBuild is not working, doing poll directly
-		build := &gojenkins.Build{
-			Jenkins: j.instance,
-			Depth:   1,
-			Base:    baseURL,
-			Raw:     new(gojenkins.BuildResponse),
-		}
-		status, err := build.Poll()
-		if err != nil || status != 200 {
-			if err == nil && status != 200 {
-				err = fmt.Errorf("status code %d", status)
 			}
-			te.url = j.URL + baseURL + "/api/json"
-			go func(te typedErr, err error) {
-				errC <- wrapErr(te, err, errRetrieveLatestBuild)
-			}(*te, err)
-			return
-		}
-
-		if build.Raw.Building {
-			log.Printf("D! Ignore running build on %s, build %v", sj.name, number)
-			wg.Done()
-			continue
-		}
-
-		// stop if build is too old
-
-		if (j.MaxBuildAge != internal.Duration{Duration: 0}) {
-			buildSecAgo := time.Now().Sub(build.GetTimestamp()).Seconds()
-			if time.Now().Sub(build.GetTimestamp()).Seconds() > j.MaxBuildAge.Duration.Seconds() {
-				log.Printf("D! Job %s build %v too old (%v seconds ago), skipping to next job", sj.name, number, buildSecAgo)
-				wg.Done()
-				continue
-			}
-		}
-
-		gatherJobBuild(sj, build, acc)
-		wg.Done()
-
+		}(jobsC, acc, &wg)
 	}
+	wg.Wait()
 }
 
-type srcJob struct {
+func (j *Jenkins) getJobDetail(sj jobRequest, jobsC chan<- jobRequest, wg *sync.WaitGroup, acc telegraf.Accumulator) *Error {
+	defer wg.Done()
+	if j.MaxSubJobDepth > 0 && sj.layer == j.MaxSubJobDepth {
+		return nil
+	}
+	// filter out excluded job.
+	if j.jobFilter != nil && j.jobFilter.Match(sj.hierarchyName()) {
+		return nil
+	}
+	url := j.URL + "/job/" + strings.Join(sj.combined(), "/job/") + "/api/json"
+	jobDetail, err := j.instance.GetJob(sj.name, sj.parents...)
+	if err != nil {
+		return newError(err, errRetrieveInnerJobs, url)
+	}
+
+	for k, innerJob := range jobDetail.Raw.Jobs {
+		if k < len(jobDetail.Raw.Jobs)-j.MaxSubJobPerLayer-1 {
+			continue
+		}
+		wg.Add(1)
+		// schedule tcp fetch for inner jobs
+		go func(innerJob gojenkins.InnerJob, sj jobRequest) {
+			jobsC <- jobRequest{
+				name:    innerJob.Name,
+				parents: sj.combined(),
+				layer:   sj.layer + 1,
+			}
+		}(innerJob, sj)
+	}
+
+	// collect build info
+	number := jobDetail.Raw.LastBuild.Number
+	if number < 1 {
+		// no build info
+		return nil
+	}
+	baseURL := "/job/" + strings.Join(sj.combined(), "/job/") + "/" + strconv.Itoa(int(number))
+	// jobDetail.GetBuild is not working, doing poll directly
+	build := &gojenkins.Build{
+		Jenkins: j.instance,
+		Depth:   1,
+		Base:    baseURL,
+		Raw:     new(gojenkins.BuildResponse),
+	}
+	status, err := build.Poll()
+	if err != nil || status != 200 {
+		if err == nil && status != 200 {
+			err = fmt.Errorf("status code %d", status)
+		}
+		return newError(err, errRetrieveLatestBuild, j.URL+baseURL+"/api/json")
+	}
+
+	if build.Raw.Building {
+		log.Printf("D! Ignore running build on %s, build %v", sj.name, number)
+		return nil
+	}
+
+	// stop if build is too old
+
+	if (j.MaxBuildAge != internal.Duration{Duration: 0}) {
+		buildAgo := time.Now().Sub(build.GetTimestamp())
+		if buildAgo.Seconds() > j.MaxBuildAge.Duration.Seconds() {
+			log.Printf("D! Job %s build %v too old (%s ago), skipping to next job", sj.name, number, buildAgo)
+			return nil
+		}
+	}
+
+	gatherJobBuild(sj, build, acc)
+	return nil
+}
+
+type jobRequest struct {
 	name    string
 	parents []string
 	layer   int
 }
 
-func (sj srcJob) combined() []string {
+func (sj jobRequest) combined() []string {
 	return append(sj.parents, sj.name)
 }
 
-func (sj srcJob) hierarchyName() string {
+func (sj jobRequest) hierarchyName() string {
 	return strings.Join(sj.combined(), "/")
 }
 
-func gatherJobBuild(sj srcJob, build *gojenkins.Build, acc telegraf.Accumulator) {
+func gatherJobBuild(sj jobRequest, build *gojenkins.Build, acc telegraf.Accumulator) {
 	tags := map[string]string{"job_name": sj.hierarchyName(), "result": build.GetResult()}
 	fields := make(map[string]interface{})
 	fields["duration"] = build.GetDuration()
