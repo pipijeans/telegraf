@@ -2,7 +2,6 @@ package jenkins
 
 import (
 	"encoding/json"
-	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sort"
@@ -14,40 +13,6 @@ import (
 	"github.com/influxdata/telegraf/testutil"
 	"github.com/kelwang/gojenkins"
 )
-
-func TestErr(t *testing.T) {
-	tests := []struct {
-		err    *Error
-		output string
-	}{
-		{
-			nil,
-			"",
-		},
-		{
-			&Error{
-				reference: errConnectJenkins,
-				url:       "http://badurl.com",
-				err:       errors.New("unknown error"),
-			},
-			"error connect jenkins instance[http://badurl.com]: unknown error",
-		},
-		{
-			newError(errors.New("2"), errEmptyMonitorData, "http://badurl.com"),
-			"error empty monitor data[http://badurl.com]: 2",
-		},
-		{
-			badFormatErr("http://badurl.com", 20.12, "string", "arch"),
-			"error bad format[http://badurl.com]: fieldName: arch, want string, got float64",
-		},
-	}
-	for _, test := range tests {
-		output := test.err.Error()
-		if output != test.output {
-			t.Errorf("Expected %s, got %s\n", test.output, output)
-		}
-	}
-}
 
 func TestJobRequest(t *testing.T) {
 	tests := []struct {
@@ -129,10 +94,10 @@ type monitorData struct {
 
 func TestGatherNodeData(t *testing.T) {
 	tests := []struct {
-		name   string
-		input  mockHandler
-		output *testutil.Accumulator
-		oe     *Error
+		name    string
+		input   mockHandler
+		output  *testutil.Accumulator
+		wantErr bool
 	}{
 		{
 			name: "bad endpoint",
@@ -142,9 +107,7 @@ func TestGatherNodeData(t *testing.T) {
 					"/computer/api/json": nil,
 				},
 			},
-			oe: &Error{
-				reference: errRetrieveNode,
-			},
+			wantErr: true,
 		},
 		{
 			name: "bad node data",
@@ -160,9 +123,7 @@ func TestGatherNodeData(t *testing.T) {
 					},
 				},
 			},
-			oe: &Error{
-				reference: errEmptyNodeName,
-			},
+			wantErr: true,
 		},
 		{
 			name: "bad empty monitor data",
@@ -177,9 +138,7 @@ func TestGatherNodeData(t *testing.T) {
 					},
 				},
 			},
-			oe: &Error{
-				reference: errEmptyMonitorData,
-			},
+			wantErr: true,
 		},
 		{
 			name: "bad monitor data format",
@@ -195,9 +154,7 @@ func TestGatherNodeData(t *testing.T) {
 					},
 				},
 			},
-			oe: &Error{
-				reference: errBadFormat,
-			},
+			wantErr: true,
 		},
 		{
 			name: "filtered nodes",
@@ -286,22 +243,13 @@ func TestGatherNodeData(t *testing.T) {
 		acc := new(testutil.Accumulator)
 		j.gatherNodesData(acc)
 		if err := acc.FirstError(); err != nil {
-			te = err.(*Error)
+			te = err
 		}
 
-		if test.oe == nil && te != nil {
+		if !test.wantErr && te != nil {
 			t.Fatalf("%s: failed %s, expected to be nil", test.name, te.Error())
-		} else if test.oe != nil {
-			test.oe.url = ts.URL + "/computer/api/json"
-			if te == nil {
-				t.Fatalf("%s: want err: %s, got nil", test.name, test.oe.Error())
-			}
-			if test.oe.reference != te.reference {
-				t.Fatalf("%s: bad error msg Expected %s, got %s\n", test.name, test.oe.reference, te.reference)
-			}
-			if test.oe.url != te.url {
-				t.Fatalf("%s: bad error url Expected %s, got %s\n", test.name, test.oe.url, te.url)
-			}
+		} else if test.wantErr && te == nil {
+			t.Fatalf("%s: expected err, got nil", test.name)
 		}
 		if test.output == nil && len(acc.Metrics) > 0 {
 			t.Fatalf("%s: collected extra data", test.name)
@@ -331,10 +279,10 @@ func TestNewInstance(t *testing.T) {
 	mockClient := &http.Client{Transport: &http.Transport{}}
 	tests := []struct {
 		// name of the test
-		name   string
-		input  *Jenkins
-		output *Jenkins
-		oe     *Error
+		name    string
+		input   *Jenkins
+		output  *Jenkins
+		wantErr bool
 	}{
 		{
 			name: "bad jenkins config",
@@ -342,10 +290,7 @@ func TestNewInstance(t *testing.T) {
 				URL:             "http://a bad url",
 				ResponseTimeout: internal.Duration{Duration: time.Microsecond},
 			},
-			oe: &Error{
-				url:       "http://a bad url",
-				reference: errConnectJenkins,
-			},
+			wantErr: true,
 		},
 		{
 			name: "has filter",
@@ -370,15 +315,10 @@ func TestNewInstance(t *testing.T) {
 	}
 	for _, test := range tests {
 		te := test.input.newInstance(mockClient)
-		if test.oe == nil && te != nil {
+		if !test.wantErr && te != nil {
 			t.Fatalf("%s: failed %s, expected to be nil", test.name, te.Error())
-		} else if test.oe != nil {
-			if test.oe.reference != te.reference {
-				t.Fatalf("%s: bad error msg Expected %s, got %s\n", test.name, test.oe.reference, te.reference)
-			}
-			if test.oe.url != te.url {
-				t.Fatalf("%s: bad error url Expected %s, got %s\n", test.name, test.oe.url, te.url)
-			}
+		} else if test.wantErr && te == nil {
+			t.Fatalf("%s: expected err, got nil", test.name)
 		}
 		if test.output != nil {
 			if test.input.instance == nil {
@@ -394,10 +334,10 @@ func TestNewInstance(t *testing.T) {
 
 func TestGatherJobs(t *testing.T) {
 	tests := []struct {
-		name   string
-		input  mockHandler
-		output *testutil.Accumulator
-		oe     *Error
+		name    string
+		input   mockHandler
+		output  *testutil.Accumulator
+		wantErr bool
 	}{
 		{
 			name:  "empty job",
@@ -414,10 +354,7 @@ func TestGatherJobs(t *testing.T) {
 					},
 				},
 			},
-			oe: &Error{
-				reference: errRetrieveInnerJobs,
-				url:       "/job/job1/api/json",
-			},
+			wantErr: true,
 		},
 		{
 			name: "jobs has no build",
@@ -448,10 +385,7 @@ func TestGatherJobs(t *testing.T) {
 					},
 				},
 			},
-			oe: &Error{
-				url:       "/job/job1/1/api/json",
-				reference: errRetrieveLatestBuild,
-			},
+			wantErr: true,
 		},
 		{
 			name: "ignore building job",
@@ -671,22 +605,14 @@ func TestGatherJobs(t *testing.T) {
 		acc := new(testutil.Accumulator)
 		j.gatherJobs(acc)
 		if err := acc.FirstError(); err != nil {
-			te = err.(*Error)
+			te = err
 		}
-		if test.oe == nil && te != nil {
+		if !test.wantErr && te != nil {
 			t.Fatalf("%s: failed %s, expected to be nil", test.name, te.Error())
-		} else if test.oe != nil {
-			test.oe.url = ts.URL + test.oe.url
-			if te == nil {
-				t.Fatalf("%s: want err: %s, got nil", test.name, test.oe.Error())
-			}
-			if test.oe.reference != te.reference {
-				t.Fatalf("%s: bad error msg Expected %s, got %s\n", test.name, test.oe.reference, te.reference)
-			}
-			if test.oe.url != te.url {
-				t.Fatalf("%s: bad error url Expected %s, got %s\n", test.name, test.oe.url, te.url)
-			}
+		} else if test.wantErr && te == nil {
+			t.Fatalf("%s: expected err, got nil", test.name)
 		}
+
 		if test.output != nil && len(test.output.Metrics) > 0 {
 			// sort metrics
 			sort.Slice(acc.Metrics, func(i, j int) bool {

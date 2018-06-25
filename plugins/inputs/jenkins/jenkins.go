@@ -82,51 +82,9 @@ const (
 	measurementJob  = "jenkins_job"
 )
 
-// Error base type of error.
-type Error struct {
-	err       error
-	reference string
-	url       string
+func badFormatErr(url string, field interface{}, want string, fieldName string) error {
+	return fmt.Errorf("error bad format[%s]: fieldName: %s, want %s, got %T", url, fieldName, want, field)
 }
-
-func newError(err error, ref, url string) *Error {
-	return &Error{
-		err:       err,
-		reference: ref,
-		url:       url,
-	}
-}
-
-func (e *Error) Error() string {
-	if e == nil {
-		return ""
-	}
-	return fmt.Sprintf("error %s[%s]: %v", e.reference, e.url, e.err)
-}
-
-func badFormatErr(url string, field interface{}, want string, fieldName string) *Error {
-	return &Error{
-		err:       fmt.Errorf("fieldName: %s, want %s, got %T", fieldName, want, field),
-		reference: errBadFormat,
-		url:       url,
-	}
-}
-
-// err references
-const (
-	errParseConfig         = "parse jenkins config"
-	errJobFilterCompile    = "compile job filters"
-	errNodeFilterCompile   = "compile node filters"
-	errConnectJenkins      = "connect jenkins instance"
-	errInitJenkins         = "init jenkins instance"
-	errRetrieveNode        = "retrieving nodes"
-	errRetrieveJobs        = "retrieving jobs"
-	errEmptyNodeName       = "empty node name"
-	errEmptyMonitorData    = "empty monitor data"
-	errBadFormat           = "bad format"
-	errRetrieveInnerJobs   = "retrieving inner jobs"
-	errRetrieveLatestBuild = "retrieving latest build"
-)
 
 // SampleConfig implements telegraf.Input interface
 func (j *Jenkins) SampleConfig() string {
@@ -156,38 +114,39 @@ func (j *Jenkins) Gather(acc telegraf.Accumulator) error {
 	return nil
 }
 
-func (j *Jenkins) initClient() (*http.Client, *Error) {
+func (j *Jenkins) initClient() (*http.Client, error) {
 	tlsCfg, err := j.ClientConfig.TLSConfig()
 	if err != nil {
-		return nil, newError(err, errParseConfig, j.URL)
+		return nil, fmt.Errorf("error parse jenkins config[%s]: %v", j.URL, err)
 	}
 	return &http.Client{
 		Transport: &http.Transport{
 			TLSClientConfig: tlsCfg,
+			MaxIdleConns:    j.MaxConnections,
 		},
 		Timeout: j.ResponseTimeout.Duration,
 	}, nil
 }
 
 // seperate the client as dependency to use httptest Client for mocking
-func (j *Jenkins) newInstance(client *http.Client) *Error {
+func (j *Jenkins) newInstance(client *http.Client) error {
 	// create instance
 	var err error
 	j.instance, err = gojenkins.CreateJenkins(client, j.URL, j.Username, j.Password).Init()
 	if err != nil {
-		return newError(err, errConnectJenkins, j.URL)
+		return fmt.Errorf("error connect jenkins instance[%s]: %v", j.URL, err)
 	}
 
 	// init job filter
 	j.jobFilter, err = filter.Compile(j.JobExclude)
 	if err != nil {
-		return newError(err, errJobFilterCompile, j.URL)
+		return fmt.Errorf("error compile job filters[%s]: %v", j.URL, err)
 	}
 
 	// init node filter
 	j.nodeFilter, err = filter.Compile(j.NodeExclude)
 	if err != nil {
-		return newError(err, errNodeFilterCompile, j.URL)
+		return fmt.Errorf("error compile node filters[%s]: %v", j.URL, err)
 	}
 
 	// init tcp pool with default value
@@ -203,7 +162,7 @@ func (j *Jenkins) newInstance(client *http.Client) *Error {
 	return nil
 }
 
-func (j *Jenkins) gatherNodeData(node *gojenkins.Node, url string, acc telegraf.Accumulator) *Error {
+func (j *Jenkins) gatherNodeData(node *gojenkins.Node, url string, acc telegraf.Accumulator) error {
 	tags := map[string]string{}
 	fields := make(map[string]interface{})
 
@@ -211,7 +170,7 @@ func (j *Jenkins) gatherNodeData(node *gojenkins.Node, url string, acc telegraf.
 
 	// detect the parsing error, since gojenkins lib won't do it
 	if info == nil || info.DisplayName == "" {
-		return newError(nil, errEmptyNodeName, url)
+		return fmt.Errorf("error empty node name[%s]: ", j.URL)
 	}
 
 	tags["node_name"] = info.DisplayName
@@ -222,7 +181,7 @@ func (j *Jenkins) gatherNodeData(node *gojenkins.Node, url string, acc telegraf.
 	}
 
 	if info.MonitorData.Hudson_NodeMonitors_ArchitectureMonitor == nil {
-		return newError(fmt.Errorf("maybe check your permission"), errEmptyMonitorData, url)
+		return fmt.Errorf("error empty monitor data[%s]: ", j.URL)
 	}
 	tags["arch"], ok = info.MonitorData.Hudson_NodeMonitors_ArchitectureMonitor.(string)
 	if !ok {
@@ -292,7 +251,7 @@ func (j *Jenkins) gatherNodesData(acc telegraf.Accumulator) {
 	// since gojenkins lib will never return error
 	// returns error for len(nodes) is 0
 	if err != nil || len(nodes) == 0 {
-		acc.AddError(newError(err, errRetrieveNode, url))
+		acc.AddError(fmt.Errorf("error retrieving nodes[%s]: %v", j.URL, err))
 		return
 	}
 	// get node data
@@ -308,7 +267,7 @@ func (j *Jenkins) gatherNodesData(acc telegraf.Accumulator) {
 func (j *Jenkins) gatherJobs(acc telegraf.Accumulator) {
 	jobs, err := j.instance.GetAllJobNames()
 	if err != nil {
-		acc.AddError(newError(err, errRetrieveJobs, j.URL))
+		acc.AddError(fmt.Errorf("error retrieving jobs[%s]: %v", j.URL, err))
 		return
 	}
 	jobsC := make(chan jobRequest, j.MaxConnections)
@@ -336,7 +295,7 @@ func (j *Jenkins) gatherJobs(acc telegraf.Accumulator) {
 	wg.Wait()
 }
 
-func (j *Jenkins) getJobDetail(sj jobRequest, jobsC chan<- jobRequest, wg *sync.WaitGroup, acc telegraf.Accumulator) *Error {
+func (j *Jenkins) getJobDetail(sj jobRequest, jobsC chan<- jobRequest, wg *sync.WaitGroup, acc telegraf.Accumulator) error {
 	defer wg.Done()
 	if j.MaxSubJobDepth > 0 && sj.layer == j.MaxSubJobDepth {
 		return nil
@@ -348,7 +307,7 @@ func (j *Jenkins) getJobDetail(sj jobRequest, jobsC chan<- jobRequest, wg *sync.
 	url := j.URL + "/job/" + strings.Join(sj.combined(), "/job/") + "/api/json"
 	jobDetail, err := j.instance.GetJob(sj.name, sj.parents...)
 	if err != nil {
-		return newError(err, errRetrieveInnerJobs, url)
+		return fmt.Errorf("error retrieving inner jobs[%s]: ", url)
 	}
 
 	for k, innerJob := range jobDetail.Raw.Jobs {
@@ -385,7 +344,7 @@ func (j *Jenkins) getJobDetail(sj jobRequest, jobsC chan<- jobRequest, wg *sync.
 		if err == nil && status != 200 {
 			err = fmt.Errorf("status code %d", status)
 		}
-		return newError(err, errRetrieveLatestBuild, j.URL+baseURL+"/api/json")
+		return fmt.Errorf("error retrieving inner jobs[%s]: %v", j.URL+baseURL+"/api/json", err)
 	}
 
 	if build.Raw.Building {
