@@ -466,12 +466,6 @@
   revision = "95032a82bc518f77982ea72343cc1ade730072f0"
 
 [[projects]]
-  name = "github.com/kelwang/gojenkins"
-  packages = ["."]
-  revision = "4ea2f2d0a3e1350cf32d33b31ad175a2521425de"
-  version = "v1.0.1"
-
-[[projects]]
   branch = "master"
   name = "github.com/kr/logfmt"
   packages = ["."]
@@ -974,6 +968,6 @@
 [solve-meta]
   analyzer-name = "dep"
   analyzer-version = 1
-  inputs-digest = "ef689441bcd85892bf7b2818fd5def10c2d59112ad13cdf44512efb1f2e48c6a"
+  inputs-digest = "024194b983d91b9500fe97e0aa0ddb5fe725030cb51ddfb034e386cae1098370"
   solver-name = "gps-cdcl"
   solver-version = 1
